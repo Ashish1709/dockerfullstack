@@ -1,0 +1,161 @@
+# All Docker services for this full-stack project.
+services:
+  # PostgreSQL database service.
+  postgres:
+    # Use lightweight PostgreSQL version 16 image.
+    image: postgres:16-alpine
+
+    # Fixed container name for easy debugging.
+    container_name: dockerfullstack-postgres
+
+    # Expose PostgreSQL from container port 5432 to system port 5432.
+    ports:
+      - "5432:5432"
+
+    # Default PostgreSQL database credentials and database name.
+    environment:
+      # PostgreSQL username.
+      POSTGRES_USER: postgres
+
+      # PostgreSQL password.
+      POSTGRES_PASSWORD: postgres
+
+      # PostgreSQL database name created automatically.
+      POSTGRES_DB: dockerfullstack
+
+    # Save PostgreSQL data permanently in Docker volume.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    # Healthcheck confirms PostgreSQL is ready before backend connects.
+    healthcheck:
+      # pg_isready checks if PostgreSQL can accept connections.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d dockerfullstack"]
+
+      # Run healthcheck every 5 seconds.
+      interval: 5s
+
+      # Wait max 5 seconds for each healthcheck.
+      timeout: 5s
+
+      # Retry 10 times before marking container unhealthy.
+      retries: 10
+
+  # pgAdmin service for managing PostgreSQL in browser.
+  pgadmin:
+    # Official pgAdmin Docker image.
+    image: dpage/pgadmin4
+
+    # Fixed container name for easy debugging.
+    container_name: dockerfullstack-pgadmin
+
+    # Open pgAdmin on http://localhost:5050.
+    ports:
+      - "5050:80"
+
+    # pgAdmin login details.
+    environment:
+      # pgAdmin login email.
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+
+      # pgAdmin login password.
+      PGADMIN_DEFAULT_PASSWORD: admin
+
+      # Disable pgAdmin online update check to avoid SSL certificate error.
+      PGADMIN_CONFIG_UPGRADE_CHECK_ENABLED: "False"
+
+    # Save pgAdmin settings permanently.
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+    # Start pgAdmin after postgres container starts.
+    depends_on:
+      - postgres
+
+  # Nest.js backend service.
+  backend:
+    # Build backend image from backend/Dockerfile.
+    build:
+      context: ./backend
+
+    # Fixed backend container name.
+    container_name: dockerfullstack-backend
+
+    # Open backend on http://localhost:3001.
+    ports:
+      - "3001:3001"
+
+    # Mount backend code and keep node_modules inside Docker volume.
+    volumes:
+      # Mount local backend folder into container /app.
+      - ./backend:/app
+
+      # Keep backend node_modules inside Docker volume.
+      - backend_node_modules:/app/node_modules
+
+      # Mount uploads folder for product images.
+      - ./backend/uploads:/app/uploads
+
+    # Load backend environment variables from backend/.env.
+    env_file:
+      - ./backend/.env
+
+    # Wait until PostgreSQL healthcheck is successful.
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # Run Nest.js in development watch mode.
+    command: npm run start:dev
+
+  # Next.js frontend service.
+  frontend:
+    # Build frontend image from frontend/Dockerfile.
+    build:
+      context: ./frontend
+
+    # Fixed frontend container name.
+    container_name: dockerfullstack-frontend
+
+    # Open frontend on http://localhost:3000.
+    ports:
+      - "3000:3000"
+
+    # Mount frontend code and keep node_modules/.next inside Docker volumes.
+    volumes:
+      # Mount local frontend folder into container /app.
+      - ./frontend:/app
+
+      # Keep frontend node_modules inside Docker volume.
+      - frontend_node_modules:/app/node_modules
+
+      # Keep Next.js build/cache folder inside Docker volume.
+      - frontend_next:/app/.next
+
+    # Load frontend environment variables from frontend/.env.local.
+    env_file:
+      - ./frontend/.env.local
+
+    # Start frontend after backend container starts.
+    depends_on:
+      - backend
+
+    # Run Next.js with webpack because Turbopack caused error.
+    command: npm run dev -- --hostname 0.0.0.0 --webpack
+
+# Named Docker volumes.
+volumes:
+  # Stores PostgreSQL database data.
+  postgres_data:
+
+  # Stores pgAdmin settings.
+  pgadmin_data:
+
+  # Stores backend node_modules.
+  backend_node_modules:
+
+  # Stores frontend node_modules.
+  frontend_node_modules:
+
+  # Stores frontend .next cache.
+  frontend_next:
