@@ -1,3 +1,4 @@
+// BadRequestException is used when uploaded file type is invalid.
 // Body reads request body.
 // Controller creates route group.
 // Delete creates DELETE API.
@@ -6,8 +7,11 @@
 // Patch creates PATCH API.
 // Post creates POST API.
 // Query reads query params.
+// UploadedFiles reads files uploaded by multer.
 // UseGuards protects routes.
+// UseInterceptors enables file upload interceptor.
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -16,11 +20,26 @@ import {
   Patch,
   Post,
   Query,
+  UploadedFiles,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
 
-// Role enum contains "user" and "admin".
-import { Role } from '../common/enums/role.enum';
+// FilesInterceptor handles multiple file upload.
+import { FilesInterceptor } from '@nestjs/platform-express';
+
+// randomUUID creates unique filenames.
+import { randomUUID } from 'crypto';
+
+// mkdirSync creates upload folder if missing.
+import { mkdirSync } from 'fs';
+
+// diskStorage stores uploaded files on disk.
+import { diskStorage } from 'multer';
+
+// extname gets file extension.
+// join creates safe file/folder path.
+import { extname, join } from 'path';
 
 // CurrentUser gives logged-in user from JWT.
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
@@ -33,6 +52,9 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
 // RolesGuard checks user role permission.
 import { RolesGuard } from '../auth/guards/roles.guard';
+
+// Role enum contains "user" and "admin".
+import { Role } from '../common/enums/role.enum';
 
 // CreateProductDto validates create product body.
 import { CreateProductDto } from './dto/create-product.dto';
@@ -59,6 +81,69 @@ type AuthUser = {
 
   // Logged-in user role.
   role: Role;
+};
+
+// Product image upload folder.
+// process.cwd() is /app inside Docker backend container.
+const PRODUCT_UPLOAD_DIR = join(process.cwd(), 'uploads', 'products');
+
+// Allowed image MIME types.
+// This blocks uploading PDF, JS, EXE, etc.
+const ALLOWED_IMAGE_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+
+// Maximum images user can upload in one request.
+const MAX_IMAGES_PER_REQUEST = 5;
+
+// Maximum size for each image.
+// Here 2 MB per image.
+const MAX_IMAGE_SIZE_IN_BYTES = 2 * 1024 * 1024;
+
+// Multer storage configuration.
+// This decides where uploaded files are saved and what filename is used.
+const productImageStorage = diskStorage({
+  // destination decides upload folder.
+  destination: (_request, _file, callback) => {
+    // Create upload folder if it does not exist.
+    mkdirSync(PRODUCT_UPLOAD_DIR, { recursive: true });
+
+    // Tell multer to save files in products upload folder.
+    callback(null, PRODUCT_UPLOAD_DIR);
+  },
+
+  // filename decides saved filename.
+  filename: (_request, file, callback) => {
+    // Get original file extension.
+    // Example: .jpg, .png, .webp
+    const extension = extname(file.originalname).toLowerCase();
+
+    // Create unique filename.
+    // Example: uuid.jpg
+    const filename = `${randomUUID()}${extension}`;
+
+    // Tell multer to use this filename.
+    callback(null, filename);
+  },
+});
+
+// File filter checks uploaded file type before saving.
+const productImageFileFilter = (
+  _request: unknown,
+  file: Express.Multer.File,
+  callback: (error: Error | null, acceptFile: boolean) => void,
+) => {
+  // Check MIME type.
+  const isAllowed = ALLOWED_IMAGE_MIME_TYPES.includes(file.mimetype);
+
+  // If file is not allowed image type, reject it.
+  if (!isAllowed) {
+    return callback(
+      new BadRequestException('Only JPG, PNG, and WEBP images are allowed'),
+      false,
+    );
+  }
+
+  // Accept valid image file.
+  return callback(null, true);
 };
 
 // @Controller('products') means all routes start with /products.
@@ -135,6 +220,42 @@ export class ProductsController {
     return this.productsService.create(body, user);
   }
 
+  // POST /products/:id/images
+  // Upload multiple images for one product.
+  @Post(':id/images')
+
+  // User must be logged in.
+  @UseGuards(JwtAuthGuard)
+
+  // FilesInterceptor handles multiple files from form-data key "images".
+  @UseInterceptors(
+    FilesInterceptor('images', MAX_IMAGES_PER_REQUEST, {
+      // Save files on disk.
+      storage: productImageStorage,
+
+      // Validate file type.
+      fileFilter: productImageFileFilter,
+
+      // Validate file size.
+      limits: {
+        fileSize: MAX_IMAGE_SIZE_IN_BYTES,
+      },
+    }),
+  )
+  addImages(
+    // Product id from URL.
+    @Param('id') id: string,
+
+    // Uploaded files from form-data field named "images".
+    @UploadedFiles() files: Express.Multer.File[],
+
+    // Logged-in user.
+    @CurrentUser() user: AuthUser,
+  ) {
+    // Add images to product.
+    return this.productsService.addImages(id, files, user);
+  }
+
   // PATCH /products/:id
   // Owner or admin can update product.
   @Patch(':id')
@@ -173,6 +294,46 @@ export class ProductsController {
   ) {
     // Update stock and low stock alert.
     return this.productsService.updateInventory(id, body, user);
+  }
+
+  // PATCH /products/:id/images/:imageId/primary
+  // Owner or admin can set product primary image.
+  @Patch(':id/images/:imageId/primary')
+
+  // Protect route with JWT.
+  @UseGuards(JwtAuthGuard)
+  setPrimaryImage(
+    // Product id from URL.
+    @Param('id') id: string,
+
+    // Image id from URL.
+    @Param('imageId') imageId: string,
+
+    // Logged-in user.
+    @CurrentUser() user: AuthUser,
+  ) {
+    // Set selected image as primary.
+    return this.productsService.setPrimaryImage(id, imageId, user);
+  }
+
+  // DELETE /products/:id/images/:imageId
+  // Owner or admin can delete product image.
+  @Delete(':id/images/:imageId')
+
+  // Protect route with JWT.
+  @UseGuards(JwtAuthGuard)
+  removeImage(
+    // Product id from URL.
+    @Param('id') id: string,
+
+    // Image id from URL.
+    @Param('imageId') imageId: string,
+
+    // Logged-in user.
+    @CurrentUser() user: AuthUser,
+  ) {
+    // Delete image.
+    return this.productsService.removeImage(id, imageId, user);
   }
 
   // DELETE /products/:id

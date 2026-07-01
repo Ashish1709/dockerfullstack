@@ -1,11 +1,19 @@
-// ForbiddenException is used when user is not allowed to edit/delete product.
+// BadRequestException is used when uploaded images are invalid.
+// ForbiddenException is used when user cannot manage product.
 // Injectable makes this class a Nest.js service.
-// NotFoundException is used when product does not exist.
+// NotFoundException is used when product/image does not exist.
 import {
+  BadRequestException,
   ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+
+// unlink deletes image file from disk.
+import { unlink } from 'fs/promises';
+
+// join safely creates file path.
+import { join } from 'path';
 
 // InjectRepository allows us to inject TypeORM repositories.
 import { InjectRepository } from '@nestjs/typeorm';
@@ -388,17 +396,204 @@ export class ProductsService {
   }
 
   // remove() deletes a product.
+  // It also deletes related uploaded image files from disk.
   async remove(id: string, user: AuthUser) {
     // Find product and check permission.
+    // This method already loads product images because relations.images is true.
     const product = await this.findOneForOwnerOrAdmin(id, user);
 
+    // Collect image filenames before deleting product from database.
+    // We need filenames so we can delete physical files from uploads/products.
+    const imageFilenames = (product.images ?? []).map(
+      (image) => image.filename,
+    );
+
     // Delete product from database.
+    // Because ProductImage has onDelete: 'CASCADE',
+    // related product_images rows will also be deleted from database.
     await this.productsRepository.remove(product);
+
+    // Delete physical image files from backend/uploads/products folder.
+    // Promise.all runs all delete operations together.
+    await Promise.all(
+      imageFilenames.map((filename) => this.removeStoredImageFile(filename)),
+    );
 
     // Return success message.
     return {
       message: 'Product deleted successfully',
     };
+  }
+
+    // addImages() adds one or multiple images to a product.
+  // User must be product owner or admin.
+  async addImages(
+    // Product id from URL.
+    id: string,
+
+    // Uploaded files from multer.
+    files: Express.Multer.File[] | undefined,
+
+    // Logged-in user from JWT.
+    user: AuthUser,
+  ) {
+    // If no files uploaded, return bad request.
+    if (!files || files.length === 0) {
+      throw new BadRequestException('Please upload at least one image');
+    }
+
+    // Find product and check owner/admin permission.
+    const product = await this.findOneForOwnerOrAdmin(id, user);
+
+    // Existing product images.
+    const existingImages = product.images ?? [];
+
+    // Limit total images per product.
+    // This protects storage and keeps product UI clean.
+    const maxImagesPerProduct = 10;
+
+    // If upload will exceed max image limit, delete uploaded files and throw error.
+    if (existingImages.length + files.length > maxImagesPerProduct) {
+      await this.removeUploadedFiles(files);
+
+      throw new BadRequestException(
+        `A product can have maximum ${maxImagesPerProduct} images`,
+      );
+    }
+
+    // Check if product already has a primary image.
+    const hasPrimaryImage = existingImages.some((image) => image.isPrimary);
+
+    // Create ProductImage entity objects from uploaded files.
+    const imageEntities = files.map((file, index) =>
+      this.productImagesRepository.create({
+        // Public URL used by frontend to show image.
+        url: `/uploads/products/${file.filename}`,
+
+        // Stored filename on disk.
+        filename: file.filename,
+
+        // Connect image to product.
+        productId: product.id,
+
+        // If product has no primary image yet,
+        // make first uploaded image primary.
+        isPrimary: !hasPrimaryImage && index === 0,
+      }),
+    );
+
+    // Save image records into product_images table.
+    await this.productImagesRepository.save(imageEntities);
+
+    // Return updated product with images.
+    return this.findOneForOwnerOrAdmin(id, user);
+  }
+
+  // setPrimaryImage() marks one image as product thumbnail/main image.
+  // User must be product owner or admin.
+  async setPrimaryImage(productId: string, imageId: string, user: AuthUser) {
+    // Find product and check permission.
+    await this.findOneForOwnerOrAdmin(productId, user);
+
+    // Find image by image id and product id.
+    const image = await this.productImagesRepository.findOne({
+      where: {
+        id: imageId,
+        productId,
+      },
+    });
+
+    // If image does not exist for this product, throw 404.
+    if (!image) {
+      throw new NotFoundException('Product image not found');
+    }
+
+    // First set all images of this product to non-primary.
+    await this.productImagesRepository.update(
+      { productId },
+      { isPrimary: false },
+    );
+
+    // Then make selected image primary.
+    image.isPrimary = true;
+
+    // Save selected image.
+    await this.productImagesRepository.save(image);
+
+    // Return updated product with images.
+    return this.findOneForOwnerOrAdmin(productId, user);
+  }
+
+  // removeImage() deletes image record and physical image file.
+  // User must be product owner or admin.
+  async removeImage(productId: string, imageId: string, user: AuthUser) {
+    // Find product and check owner/admin permission.
+    await this.findOneForOwnerOrAdmin(productId, user);
+
+    // Find image by id and product id.
+    const image = await this.productImagesRepository.findOne({
+      where: {
+        id: imageId,
+        productId,
+      },
+    });
+
+    // If image does not exist, throw 404.
+    if (!image) {
+      throw new NotFoundException('Product image not found');
+    }
+
+    // Store whether deleted image was primary.
+    const wasPrimary = image.isPrimary;
+
+    // Remove image row from database.
+    await this.productImagesRepository.remove(image);
+
+    // Remove physical file from uploads/products folder.
+    await this.removeStoredImageFile(image.filename);
+
+    // If deleted image was primary, make another image primary.
+    if (wasPrimary) {
+      // Find next available image for this product.
+      const nextImage = await this.productImagesRepository.findOne({
+        where: { productId },
+        order: { createdAt: 'ASC' },
+      });
+
+      // If another image exists, make it primary.
+      if (nextImage) {
+        nextImage.isPrimary = true;
+        await this.productImagesRepository.save(nextImage);
+      }
+    }
+
+    // Return success message.
+    return {
+      message: 'Product image deleted successfully',
+    };
+  }
+
+  // removeUploadedFiles() deletes files that were uploaded but cannot be used.
+  // Example: user uploads too many images, so we clean up disk files.
+  private async removeUploadedFiles(files: Express.Multer.File[]) {
+    // Loop all uploaded files.
+    await Promise.all(
+      files.map((file) =>
+        // Delete file by multer file path.
+        unlink(file.path).catch(() => undefined),
+      ),
+    );
+  }
+
+  // removeStoredImageFile() deletes an already saved product image file.
+  private async removeStoredImageFile(filename: string) {
+    // Build full file path.
+    // process.cwd() is /app inside backend container.
+    const filePath = join(process.cwd(), 'uploads', 'products', filename);
+
+    // Delete file.
+    // catch(() => undefined) prevents error if file already missing.
+    await unlink(filePath).catch(() => undefined);
   }
 
   // checkOwnerOrAdmin() verifies permission.
